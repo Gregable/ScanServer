@@ -1,0 +1,60 @@
+ScanServer is a simple script for use with a network attached document scanner
+to upload scanned documents to Google Drive.
+
+This was developed for use with a Brother MFC-7860DW scanner configured to
+transfer scans via ftp to a specific network directory, however it should work
+with any configuration where scanned files are dropped into a directory
+accessible to this script.
+
+All options are configured in a JSON formatted configuration file whose path is
+specified with the flag --config-file.
+
+Initial Use
+-----------
+First, create an empty config file (0 bytes) and run scanserver with
+--config-file=<empty config file>. scanserver will set up the initial json
+skeleton for you.
+
+Next you will need to create a Google OAuth Client Id and Secret via the Google
+Cloud Console. There are some instructions on how to set this up at:
+https://developers.google.com/drive/enable-sdk
+
+One you have these strings, enter them into your config file and run scanserver
+again. This time, scanserver will start a browser to get an authentication token
+for a particular Google User's account access. This token  will be written back
+to the config file. Thus, keeping the config file secure is important. Access
+will be limited to Google Drive and can be revoked at any time from the user's
+account page.
+
+Next, ScanServer will exit after printing a list of all of the Google Drive
+folders found in the authenticated account, including their name and Drive Id.
+You must select a folder to upload your scanned documents to. Selection is by
+Id and the Id must also be added to your config-file.
+
+Lastly, you must also specify in your config-file the local path which
+ScanServer will scan in which to identify files to upload to Google Drive.
+
+After ClientId, ClientSecret, OAuth token, Local Scan Dir, and Google Drive
+Remote Folder have all been specified, the next run of ScanServer will upload
+all files initially found in the Local Scan Dir.
+
+
+Repeated Runs
+-------------
+Later runs will only upload files that have been modified more recently than
+previous runs. To upload all files again, simply remove the
+LastProccessedScanTime field from your config-file. ScanServer will not delete
+files locally, so it's access to the local scan dir can be read only. The only
+local modifications made will be to the config-file.
+
+Due to the single-pass nature of ScanServer, it is intended to be run in a loop
+or as a cron job by an external process.
+
+
+Future Plans
+------------
+- Monitor for directory changes as a long-running process rather than as a cron
+  job.
+- Automatic merging of pairs of PDF files which correspond to a single
+  double-sided document scanned on a non-duplex ADF scanner.
+- Additional error handling, such as retry on Upload failure.
