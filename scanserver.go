@@ -40,7 +40,7 @@ func main() {
 
 	to_upload_chan := make(chan string)
 	done_upload_chan := make(chan string)
-	go ListScans(&config, to_upload_chan)
+	go PeriodicallyListScans(&config, to_upload_chan)
 	go UploadFiles(config, to_upload_chan, done_upload_chan)
 	for filename := range done_upload_chan {
 		fmt.Println("Successfully Uploaded file ", filename)
@@ -167,6 +167,13 @@ func ListGDriveFolders(client *http.Client) {
 	}
 }
 
+func PeriodicallyListScans(config *ScanServerConfig, files_chan chan string) {
+	for {
+		ListScans(config, files_chan)
+		time.Sleep(5 * time.Second)
+	}
+}
+
 func ListScans(config *ScanServerConfig, files_chan chan string) {
 	files, err := ioutil.ReadDir(config.LocalScanDir)
 	if err != nil {
@@ -193,7 +200,6 @@ func ListScans(config *ScanServerConfig, files_chan chan string) {
 	if config.LastProccessedScanTime.Before(max_processed_time) {
 		config.LastProccessedScanTime = max_processed_time
 	}
-	close(files_chan)
 }
 
 func UploadFiles(config ScanServerConfig,

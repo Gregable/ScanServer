@@ -36,25 +36,14 @@ ScanServer will scan in which to identify files to upload to Google Drive.
 
 After ClientId, ClientSecret, OAuth token, Local Scan Dir, and Google Drive
 Remote Folder have all been specified, the next run of ScanServer will upload
-all files initially found in the Local Scan Dir.
-
-
-Repeated Runs
--------------
-Later runs will only upload files that have been modified more recently than
-previous runs. To upload all files again, simply remove the
+all files found in the Local Scan Dir and will continue to re-scan for new files
+every 5 seconds. To upload all files again, simply remove the 
 LastProccessedScanTime field from your config-file. ScanServer will not delete
 files locally, so it's access to the local scan dir can be read only. The only
 local modifications made will be to the config-file.
 
-Due to the single-pass nature of ScanServer, it is intended to be run in a loop
-or as a cron job by an external process.
-
-
 Future Plans
 ------------
-- Monitor for directory changes as a long-running process rather than as a cron
-  job.
 - Automatic merging of pairs of PDF files which correspond to a single
   double-sided document scanned on a non-duplex ADF scanner.
 - Additional error handling, such as retry on Upload failure.
