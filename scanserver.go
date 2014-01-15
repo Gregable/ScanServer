@@ -40,7 +40,7 @@ func main() {
 
 	to_upload_chan := make(chan string)
 	done_upload_chan := make(chan string)
-	go PeriodicallyListScans(&config, to_upload_chan)
+	go PeriodicallyListScans(config, to_upload_chan)
 	go UploadFiles(config, to_upload_chan, done_upload_chan)
 	for filename := range done_upload_chan {
 		fmt.Println("Successfully Uploaded file ", filename)
@@ -166,39 +166,31 @@ func ListGDriveFolders(client *http.Client) {
 	}
 }
 
-func PeriodicallyListScans(config *ScanServerConfig, files_chan chan string) {
+func PeriodicallyListScans(config ScanServerConfig, files_chan chan string) {
+	max_processed_time := config.LastProccessedScanTime
 	for {
-		ListScans(config, files_chan)
+		files, err := ioutil.ReadDir(config.LocalScanDir)
+		if err != nil {
+			panic(err)
+		}
+
+		for _, file := range files {
+			// We don't recurse into subdirs currently.
+			if file.IsDir() {
+				continue
+			}
+			// This skips files we've already processed
+			if !max_processed_time.Before(file.ModTime()) {
+				continue
+			}
+			// Track the maximum modification time we've seen so far.
+			if file.ModTime().After(max_processed_time) {
+				max_processed_time = file.ModTime()
+			}
+
+			files_chan <- filepath.Join(config.LocalScanDir, file.Name())
+		}
 		time.Sleep(5 * time.Second)
-	}
-}
-
-func ListScans(config *ScanServerConfig, files_chan chan string) {
-	files, err := ioutil.ReadDir(config.LocalScanDir)
-	if err != nil {
-		panic(err)
-	}
-
-	var max_processed_time time.Time
-	for _, file := range files {
-		// We don't recurse into subdirs currently.
-		if file.IsDir() {
-			continue
-		}
-		// This skips files we've already processed
-		if !config.LastProccessedScanTime.Before(file.ModTime()) {
-			continue
-		}
-		// Track the maximum modification time we've seen so far.
-		if file.ModTime().After(max_processed_time) {
-			max_processed_time = file.ModTime()
-		}
-
-		files_chan <- filepath.Join(config.LocalScanDir, file.Name())
-	}
-	if config.LastProccessedScanTime.Before(max_processed_time) {
-		config.LastProccessedScanTime = max_processed_time
-		WriteConfig(*config_file, *config)
 	}
 }
 
@@ -210,13 +202,14 @@ func UploadFiles(config ScanServerConfig,
 
 	for file_to_upload := range files_to_upload_chan {
 		var go_file *os.File
-		var file_size int64 = -1
+		var err error
+		var modified_time time.Time
 		// HACK: If the file is still being created, it may be incomplete. Uploading
 		// it may end up with a partial copy or a panic by the google api. We look
 		// for a stable file size to indicate that the file has been completely
 		// written before continuing.
 		for {
-			go_file, err := os.Open(file_to_upload)
+			go_file, err = os.Open(file_to_upload)
 			if err != nil {
 				panic(fmt.Sprintf("error opening file: %v", err))
 			}
@@ -224,10 +217,10 @@ func UploadFiles(config ScanServerConfig,
 			if err != nil {
 				panic(fmt.Sprintf("error examining file stat: %v", err))
 			}
-			if file_size == file_stat.Size() {
+			if modified_time == file_stat.ModTime() {
 				break
 			} else {
-				file_size = file_stat.Size()
+				modified_time = file_stat.ModTime()
 				time.Sleep(2 * time.Second)
 			}
 		}
@@ -241,12 +234,18 @@ func UploadFiles(config ScanServerConfig,
 		parent := &drive.ParentReference{Id: config.RemoteParentFolderId}
 		file_meta.Parents = []*drive.ParentReference{parent}
 
-		_, err := service.Files.Insert(file_meta).Media(go_file).Do()
+		_, err = service.Files.Insert(file_meta).Media(go_file).Do()
 		if err != nil {
 			panic(fmt.Sprintf("error uploading file: %v", err))
 		}
 
 		files_done_chan <- file_to_upload
+
+		if config.LastProccessedScanTime.Before(modified_time) {
+			config.LastProccessedScanTime = modified_time
+			WriteConfig(*config_file, config)
+		}
+
 	}
 	close(files_done_chan)
 }
