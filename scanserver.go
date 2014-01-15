@@ -45,7 +45,6 @@ func main() {
 	for filename := range done_upload_chan {
 		fmt.Println("Successfully Uploaded file ", filename)
 	}
-	WriteConfig(*config_file, config)
 }
 
 // Returns true if config is fully specified.
@@ -199,6 +198,7 @@ func ListScans(config *ScanServerConfig, files_chan chan string) {
 	}
 	if config.LastProccessedScanTime.Before(max_processed_time) {
 		config.LastProccessedScanTime = max_processed_time
+		WriteConfig(*config_file, *config)
 	}
 }
 
@@ -209,9 +209,27 @@ func UploadFiles(config ScanServerConfig,
 	service, _ := drive.New(client)
 
 	for file_to_upload := range files_to_upload_chan {
-		go_file, err := os.Open(file_to_upload)
-		if err != nil {
-			panic(fmt.Sprintf("error opening file: %v", err))
+		var go_file *os.File
+		var file_size int64 = -1
+		// HACK: If the file is still being created, it may be incomplete. Uploading
+		// it may end up with a partial copy or a panic by the google api. We look
+		// for a stable file size to indicate that the file has been completely
+		// written before continuing.
+		for {
+			go_file, err := os.Open(file_to_upload)
+			if err != nil {
+				panic(fmt.Sprintf("error opening file: %v", err))
+			}
+			file_stat, err := go_file.Stat()
+			if err != nil {
+				panic(fmt.Sprintf("error examining file stat: %v", err))
+			}
+			if file_size == file_stat.Size() {
+				break
+			} else {
+				file_size = file_stat.Size()
+				time.Sleep(2 * time.Second)
+			}
 		}
 
 		file_meta := &drive.File{
@@ -223,7 +241,7 @@ func UploadFiles(config ScanServerConfig,
 		parent := &drive.ParentReference{Id: config.RemoteParentFolderId}
 		file_meta.Parents = []*drive.ParentReference{parent}
 
-		_, err = service.Files.Insert(file_meta).Media(go_file).Do()
+		_, err := service.Files.Insert(file_meta).Media(go_file).Do()
 		if err != nil {
 			panic(fmt.Sprintf("error uploading file: %v", err))
 		}
