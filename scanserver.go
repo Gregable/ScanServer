@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -32,6 +31,25 @@ var oauth_config = &oauth.Config{
 	TokenURL:     "https://accounts.google.com/o/oauth2/token",
 }
 
+type FileForUpload struct {
+	Path               string
+	FileName           string
+	FinalPathToCleanup string
+}
+
+func FullPath(file_for_upload FileForUpload) string {
+	return path.Join(file_for_upload.Path,
+		file_for_upload.FileName)
+}
+
+func IsDuplexFile(file_for_upload FileForUpload,
+	config ScanServerConfig) bool {
+	if config.DuplexPrefix == "" {
+		return false
+	}
+	return strings.HasPrefix(file_for_upload.FileName, config.DuplexPrefix)
+}
+
 func main() {
 	flag.Parse()
 
@@ -40,12 +58,23 @@ func main() {
 		return
 	}
 
-	to_upload_chan := make(chan string)
-	done_upload_chan := make(chan string)
-	go PeriodicallyListScans(config, to_upload_chan)
-	go UploadFiles(config, to_upload_chan, done_upload_chan)
-	for filename := range done_upload_chan {
-		fmt.Println("Successfully Uploaded file ", filename)
+	// Output files that we find to found_files_chan
+	found_files_chan := make(chan FileForUpload)
+	go PeriodicallyListScans(config, found_files_chan)
+
+	done_upload_chan := make(chan FileForUpload)
+	if config.DuplexPrefix != "" {
+		to_upload_chan := make(chan FileForUpload)
+		go MergeDuplexScans(config, found_files_chan, to_upload_chan)
+		go UploadFiles(config, to_upload_chan, done_upload_chan)
+	} else {
+		go UploadFiles(config, found_files_chan, done_upload_chan)
+	}
+	all_done_chan := make(chan FileForUpload)
+	go CleanupTmpDirs(done_upload_chan, all_done_chan)
+
+	for file := range all_done_chan {
+		fmt.Println("Successfully Uploaded file ", file.FileName)
 	}
 }
 
@@ -82,6 +111,13 @@ func PromptIfMissingConfigFields(config *ScanServerConfig) bool {
 		fmt.Println(
 			"LocalScanDir must be configured in config_file.\n",
 			"This is the path which ScanServer scans to find new files to upload.")
+		return false
+	}
+
+	if config.DuplexPrefix != "" && config.TmpDir == "" {
+		fmt.Println(
+			"If DuplexPrefix is configured in config_file, so must TmpDir.\n",
+			"This is the path which ScanServer uses to build a temporary merged pdf.")
 		return false
 	}
 
@@ -168,7 +204,8 @@ func ListGDriveFolders(client *http.Client) {
 	}
 }
 
-func PeriodicallyListScans(config ScanServerConfig, files_chan chan string) {
+func PeriodicallyListScans(config ScanServerConfig,
+	files_chan chan FileForUpload) {
 	max_processed_time := config.LastProccessedScanTime
 	for {
 		files, err := ioutil.ReadDir(config.LocalScanDir)
@@ -190,51 +227,75 @@ func PeriodicallyListScans(config ScanServerConfig, files_chan chan string) {
 				max_processed_time = file.ModTime()
 			}
 
-			files_chan <- filepath.Join(config.LocalScanDir, file.Name())
+			var file_for_upload FileForUpload
+			file_for_upload.FileName = file.Name()
+			file_for_upload.Path = config.LocalScanDir
+			files_chan <- file_for_upload
 		}
 		time.Sleep(5 * time.Second)
 	}
 }
 
-func CleanupTmpDirs(dirs_to_cleanup_chan chan string) {
-	for dir_to_cleanup := range dirs_to_cleanup_chan {
-		// TODO: This is a dumb cleanup solution, please improve.
-		// First, a delay until the upload fiber has finished. This could be made
-		// better, but it's an OK solution for now.
-		time.Sleep(15 * time.Minute)
-		os.RemoveAll(dir_to_cleanup)
+// Helper for MergeDuplexScans which clears temporary directories created once
+// they are no longer needed.
+func CleanupTmpDirs(files_to_cleanup_chan chan FileForUpload,
+	done_chan chan FileForUpload) {
+	for file_to_cleanup := range files_to_cleanup_chan {
+		if file_to_cleanup.FinalPathToCleanup != "" {
+			os.RemoveAll(file_to_cleanup.FinalPathToCleanup)
+		}
+		done_chan <- file_to_cleanup
 	}
 }
 
+// Reads from an incoming channel for pairs of front/back files, merges them
+// using command line methods, and then adds the merged file to the final
+// upload channel.
 func MergeDuplexScans(config ScanServerConfig,
-	files_to_merge_chan chan string,
-	files_to_upload_chan chan string) {
-
-	// Start a cleanup goroutine to remove tmp dirs after we're done with them.
-	dirs_to_cleanup_chan := make(chan string)
-	go CleanupTmpDirs(dirs_to_cleanup_chan)
+	files_to_merge_chan chan FileForUpload,
+	files_to_upload_chan chan FileForUpload) {
 
 	for front_side_file := range files_to_merge_chan {
-		tmpdir, err := ioutil.TempDir(config.TmpDir, "")
-		if err != nil {
-			panic(err)
+		// If it's not duplex, simply schedule for upload. Simple case.
+		if !IsDuplexFile(front_side_file, config) {
+			files_to_upload_chan <- front_side_file
+			continue
 		}
 
 		select {
 		case back_side_file := <-files_to_merge_chan:
-			merged_file, err := merge_scans(
-				front_side_file, back_side_file, config.TmpDir)
+			// We assume we won't get the first side of duplex Doc A followed by a
+			// non-duplex Doc B. If we see something like this, we simply treat both
+			// files as monoplex and upload both.
+			if !IsDuplexFile(back_side_file, config) {
+				files_to_upload_chan <- front_side_file
+				files_to_upload_chan <- back_side_file
+				continue
+			}
+
+			tmp_dir, err := ioutil.TempDir(config.TmpDir, "")
+			if err != nil {
+				panic(err)
+			}
+
+			var merged_file FileForUpload
+			merged_file.Path = tmp_dir
+			merged_file.FinalPathToCleanup = tmp_dir
+			merged_file.FileName, err = MergeScans(
+				FullPath(front_side_file), FullPath(back_side_file), tmp_dir)
 			// If we get an error, it's probably because the files have different
 			// numbers of pages. In this case, it's safer to upload them as two
 			// unmerged monoplex files.
 			// TODO: Instead, just upload the front_side_file and maybe see if a
-			// matching back_side_file comes in within the next hour.
+			// matching back_side_file comes in shortly thereafter.
 			if err != nil {
 				files_to_upload_chan <- front_side_file
 				files_to_upload_chan <- back_side_file
+				os.RemoveAll(tmp_dir)
+				continue
 			}
+
 			files_to_upload_chan <- merged_file
-			dirs_to_cleanup_chan <- tmpdir
 
 		// If an hour has elapsed, we aren't going to see the paired back side
 		// file, so go ahead and release the front side file as a monoplex file.
@@ -243,15 +304,16 @@ func MergeDuplexScans(config ScanServerConfig,
 			files_to_upload_chan <- front_side_file
 		}
 	}
+	close(files_to_upload_chan)
 }
 
 func UploadFiles(config ScanServerConfig,
-	files_to_upload_chan chan string,
-	files_done_chan chan string) {
+	files_to_upload_chan chan FileForUpload,
+	files_done_chan chan FileForUpload) {
 	client := getOAuthClient(config)
 	service, _ := drive.New(client)
 
-	for file_to_upload := range files_to_upload_chan {
+	for file_for_upload := range files_to_upload_chan {
 		var go_file *os.File
 		var err error
 		var modified_time time.Time
@@ -260,7 +322,7 @@ func UploadFiles(config ScanServerConfig,
 		// for a stable file size to indicate that the file has been completely
 		// written before continuing.
 		for {
-			go_file, err = os.Open(file_to_upload)
+			go_file, err = os.Open(FullPath(file_for_upload))
 			if err != nil {
 				panic(fmt.Sprintf("error opening file: %v", err))
 			}
@@ -277,7 +339,7 @@ func UploadFiles(config ScanServerConfig,
 		}
 
 		file_meta := &drive.File{
-			Title:    filepath.Base(file_to_upload),
+			Title:    file_for_upload.FileName,
 			MimeType: "application/pdf"}
 
 		// Set the parent folder so that these files don't just get uploaded into
@@ -290,7 +352,7 @@ func UploadFiles(config ScanServerConfig,
 			panic(fmt.Sprintf("error uploading file: %v", err))
 		}
 
-		files_done_chan <- file_to_upload
+		files_done_chan <- file_for_upload
 
 		if config.LastProccessedScanTime.Before(modified_time) {
 			config.LastProccessedScanTime = modified_time
