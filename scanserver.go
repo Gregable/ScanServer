@@ -9,7 +9,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"code.google.com/p/goauth2/oauth"
@@ -191,6 +193,55 @@ func PeriodicallyListScans(config ScanServerConfig, files_chan chan string) {
 			files_chan <- filepath.Join(config.LocalScanDir, file.Name())
 		}
 		time.Sleep(5 * time.Second)
+	}
+}
+
+func CleanupTmpDirs(dirs_to_cleanup_chan chan string) {
+	for dir_to_cleanup := range dirs_to_cleanup_chan {
+		// TODO: This is a dumb cleanup solution, please improve.
+		// First, a delay until the upload fiber has finished. This could be made
+		// better, but it's an OK solution for now.
+		time.Sleep(15 * time.Minute)
+		os.RemoveAll(dir_to_cleanup)
+	}
+}
+
+func MergeDuplexScans(config ScanServerConfig,
+	files_to_merge_chan chan string,
+	files_to_upload_chan chan string) {
+
+	// Start a cleanup goroutine to remove tmp dirs after we're done with them.
+	dirs_to_cleanup_chan := make(chan string)
+	go CleanupTmpDirs(dirs_to_cleanup_chan)
+
+	for front_side_file := range files_to_merge_chan {
+		tmpdir, err := ioutil.TempDir(config.TmpDir, "")
+		if err != nil {
+			panic(err)
+		}
+
+		select {
+		case back_side_file := <-files_to_merge_chan:
+			merged_file, err := merge_scans(
+				front_side_file, back_side_file, config.TmpDir)
+			// If we get an error, it's probably because the files have different
+			// numbers of pages. In this case, it's safer to upload them as two
+			// unmerged monoplex files.
+			// TODO: Instead, just upload the front_side_file and maybe see if a
+			// matching back_side_file comes in within the next hour.
+			if err != nil {
+				files_to_upload_chan <- front_side_file
+				files_to_upload_chan <- back_side_file
+			}
+			files_to_upload_chan <- merged_file
+			dirs_to_cleanup_chan <- tmpdir
+
+		// If an hour has elapsed, we aren't going to see the paired back side
+		// file, so go ahead and release the front side file as a monoplex file.
+		// This will help us to avoid pairing the wrong front/back files
+		case <-time.After(time.Hour):
+			files_to_upload_chan <- front_side_file
+		}
 	}
 }
 

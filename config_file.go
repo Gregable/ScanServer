@@ -15,6 +15,8 @@ type ScanServerConfig struct {
 	RemoteParentFolderId   string
 	LocalScanDir           string
 	LastProccessedScanTime time.Time
+	TmpDir                 string
+	DuplexPrefix           string
 }
 
 func ParseConfig(config_file string) ScanServerConfig {
