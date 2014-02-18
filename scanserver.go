@@ -32,9 +32,10 @@ var oauth_config = &oauth.Config{
 }
 
 type FileForUpload struct {
-	Path               string
-	FileName           string
-	FinalPathToCleanup string
+	Path                string
+	FileName            string
+	FinalPathToCleanup  string
+	PreferredUploadName string
 }
 
 func FullPath(file_for_upload FileForUpload) string {
@@ -48,6 +49,13 @@ func IsDuplexFile(file_for_upload FileForUpload,
 		return false
 	}
 	return strings.HasPrefix(file_for_upload.FileName, config.DuplexPrefix)
+}
+
+func UploadTitle(file_for_upload FileForUpload) string {
+	if file_for_upload.PreferredUploadName != "" {
+		return file_for_upload.PreferredUploadName
+	}
+	return file_for_upload.FileName
 }
 
 func main() {
@@ -74,7 +82,8 @@ func main() {
 	go CleanupTmpDirs(done_upload_chan, all_done_chan)
 
 	for file := range all_done_chan {
-		fmt.Println("Successfully Uploaded file ", file.FileName)
+		fmt.Println(
+			"Successfully Uploaded file", file.FileName, "as", UploadTitle(file))
 	}
 }
 
@@ -213,6 +222,10 @@ func PeriodicallyListScans(config ScanServerConfig,
 			panic(err)
 		}
 
+		// We may pick up multiple files between scans, so we track the max time of
+		// the last pass as well as this pass. Files since the last pass time will
+		// be added to files_chan.
+		this_pass_max_processed_time := max_processed_time
 		for _, file := range files {
 			// We don't recurse into subdirs currently.
 			if file.IsDir() {
@@ -222,16 +235,21 @@ func PeriodicallyListScans(config ScanServerConfig,
 			if !max_processed_time.Before(file.ModTime()) {
 				continue
 			}
-			// Track the maximum modification time we've seen so far.
-			if file.ModTime().After(max_processed_time) {
-				max_processed_time = file.ModTime()
-			}
 
 			var file_for_upload FileForUpload
 			file_for_upload.FileName = file.Name()
 			file_for_upload.Path = config.LocalScanDir
+			BlockUntilModificationTimeStable(FullPath(file_for_upload))
+
+			// Track the maximum modification time we've seen so far.
+			modified_time := ModifyTimeOrPanic(FullPath(file_for_upload))
+			if modified_time.After(this_pass_max_processed_time) {
+				this_pass_max_processed_time = modified_time
+			}
+
 			files_chan <- file_for_upload
 		}
+		max_processed_time = this_pass_max_processed_time
 		time.Sleep(5 * time.Second)
 	}
 }
@@ -273,6 +291,9 @@ func MergeDuplexScans(config ScanServerConfig,
 				continue
 			}
 
+			log.Println("Merging:", front_side_file.FileName, "and",
+				back_side_file.FileName)
+
 			tmp_dir, err := ioutil.TempDir(config.TmpDir, "")
 			if err != nil {
 				panic(err)
@@ -281,6 +302,7 @@ func MergeDuplexScans(config ScanServerConfig,
 			var merged_file FileForUpload
 			merged_file.Path = tmp_dir
 			merged_file.FinalPathToCleanup = tmp_dir
+			merged_file.PreferredUploadName = "merged_" + front_side_file.FileName
 			merged_file.FileName, err = MergeScans(
 				FullPath(front_side_file), FullPath(back_side_file), tmp_dir)
 			// If we get an error, it's probably because the files have different
@@ -297,14 +319,51 @@ func MergeDuplexScans(config ScanServerConfig,
 
 			files_to_upload_chan <- merged_file
 
-		// If an hour has elapsed, we aren't going to see the paired back side
+		// If an 15 min have elapsed, we aren't going to see the paired back side
 		// file, so go ahead and release the front side file as a monoplex file.
 		// This will help us to avoid pairing the wrong front/back files
-		case <-time.After(time.Hour):
+		case <-time.After(15 * time.Minute):
 			files_to_upload_chan <- front_side_file
 		}
 	}
 	close(files_to_upload_chan)
+}
+
+func ModifyTimeOrPanic(file_path string) time.Time {
+	go_file, err := os.Open(file_path)
+	if err != nil {
+		panic(fmt.Sprintf("error opening file: %v", err))
+	}
+
+	file_stat, err := go_file.Stat()
+	if err != nil {
+		panic(fmt.Sprintf("error examining file stat: %v", err))
+	}
+	return file_stat.ModTime()
+}
+
+// HACK: If the file is still being created, it may be incomplete. Processing
+// it may end up with a partial copy or a panic by the google api. We look
+// for a stable modify time to indicate that the file has been completely
+// written before continuing.
+func BlockUntilModificationTimeStable(file_path string) {
+	var modified_time time.Time
+	for {
+		if modified_time == ModifyTimeOrPanic(file_path) {
+			break
+		} else {
+			modified_time = ModifyTimeOrPanic(file_path)
+			// It's possible that the user is sitting at the flatbed scanner inputting
+			// pages one at at time with significant delays in between. Unfortunately,
+			// as it adds latency, we must delay this quite a bit.
+			// TODO: If we see a new document with a later modification time, it's
+			// probably same to assume that this one is now done and we can progress
+			// to waiting on the new document. Or at the very least process files in
+			// parallel or something as this can cause minute delays to pile up in
+			// the face of lots of scans.
+			time.Sleep(time.Minute)
+		}
+	}
 }
 
 func UploadFiles(config ScanServerConfig,
@@ -314,32 +373,13 @@ func UploadFiles(config ScanServerConfig,
 	service, _ := drive.New(client)
 
 	for file_for_upload := range files_to_upload_chan {
-		var go_file *os.File
-		var err error
-		var modified_time time.Time
-		// HACK: If the file is still being created, it may be incomplete. Uploading
-		// it may end up with a partial copy or a panic by the google api. We look
-		// for a stable file size to indicate that the file has been completely
-		// written before continuing.
-		for {
-			go_file, err = os.Open(FullPath(file_for_upload))
-			if err != nil {
-				panic(fmt.Sprintf("error opening file: %v", err))
-			}
-			file_stat, err := go_file.Stat()
-			if err != nil {
-				panic(fmt.Sprintf("error examining file stat: %v", err))
-			}
-			if modified_time == file_stat.ModTime() {
-				break
-			} else {
-				modified_time = file_stat.ModTime()
-				time.Sleep(2 * time.Second)
-			}
+		go_file, err := os.Open(FullPath(file_for_upload))
+		if err != nil {
+			panic(fmt.Sprintf("error opening file: %v", err))
 		}
 
 		file_meta := &drive.File{
-			Title:    file_for_upload.FileName,
+			Title:    UploadTitle(file_for_upload),
 			MimeType: "application/pdf"}
 
 		// Set the parent folder so that these files don't just get uploaded into
@@ -354,11 +394,11 @@ func UploadFiles(config ScanServerConfig,
 
 		files_done_chan <- file_for_upload
 
+		modified_time := ModifyTimeOrPanic(FullPath(file_for_upload))
 		if config.LastProccessedScanTime.Before(modified_time) {
 			config.LastProccessedScanTime = modified_time
 			WriteConfig(*config_file, config)
 		}
-
 	}
 	close(files_done_chan)
 }

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os/exec"
 	"path"
 	"strings"
@@ -62,17 +63,20 @@ func MergeScans(front_side_file string,
 	}
 
 	// Reorder the pages to be the correct merged order
-	var in_order_files []string
+	var args []string
 	for i := range front_files {
-		in_order_files = append(in_order_files, front_files[i])
+		args = append(args, front_files[i])
 		// I can't believe how hard it is to reverse the order of an array.
-		in_order_files = append(in_order_files, back_files[len(back_files)-1-i])
+		args = append(args, back_files[len(back_files)-1-i])
+	}
+
+	for _, arg := range args {
+		log.Println(arg)
 	}
 
 	// Execute a pdfunite call to re-merge the final document
 	output_file := path.Join(tmpdir, "out.pdf")
-	args := in_order_files[0 : len(in_order_files)+1]
-	args[len(in_order_files)] = output_file
+	args = append(args, output_file)
 	cmd := exec.Command("pdfunite", args...)
 	err := cmd.Run()
 	if err != nil {
