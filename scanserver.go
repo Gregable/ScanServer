@@ -280,50 +280,50 @@ func MergeDuplexScans(config ScanServerConfig,
 			continue
 		}
 
-		select {
-		case back_side_file := <-files_to_merge_chan:
-			// We assume we won't get the first side of duplex Doc A followed by a
-			// non-duplex Doc B. If we see something like this, we simply treat both
-			// files as monoplex and upload both.
-			if !IsDuplexFile(back_side_file, config) {
+		for {
+			select {
+			case back_side_file := <-files_to_merge_chan:
+				// We assume we won't get the first side of duplex Doc A followed by a
+				// non-duplex Doc B. If we see something like this, we simply treat both
+				// files as monoplex and upload both.
+				if !IsDuplexFile(back_side_file, config) {
+					files_to_upload_chan <- front_side_file
+					files_to_upload_chan <- back_side_file
+					break // return to outer for loop and wait for next front_side_file
+				}
+
+				log.Println("Merging:", front_side_file.FileName, "and",
+					back_side_file.FileName)
+
+				tmp_dir, err := ioutil.TempDir(config.TmpDir, "")
+				if err != nil {
+					panic(err)
+				}
+
+				var merged_file FileForUpload
+				merged_file.Path = tmp_dir
+				merged_file.FinalPathToCleanup = tmp_dir
+				merged_file.PreferredUploadName = "merged_" + front_side_file.FileName
+				merged_file.FileName, err = MergeScans(
+					FullPath(front_side_file), FullPath(back_side_file), tmp_dir)
+				// If we get an error, it's probably because the files have different
+				// numbers of pages. In this case, it's safer to upload them as two
+				// unmerged monoplex files.
+				if err != nil {
+					os.RemoveAll(tmp_dir)
+					files_to_upload_chan <- front_side_file
+					front_side_file = back_side_file
+					continue // return to inner loop and wait for next back_side_file
+				}
+
+				files_to_upload_chan <- merged_file
+
+			// If an 15 min have elapsed, we aren't going to see the paired back side
+			// file, so go ahead and release the front side file as a monoplex file.
+			// This will help us to avoid pairing the wrong front/back files
+			case <-time.After(15 * time.Minute):
 				files_to_upload_chan <- front_side_file
-				files_to_upload_chan <- back_side_file
-				continue
 			}
-
-			log.Println("Merging:", front_side_file.FileName, "and",
-				back_side_file.FileName)
-
-			tmp_dir, err := ioutil.TempDir(config.TmpDir, "")
-			if err != nil {
-				panic(err)
-			}
-
-			var merged_file FileForUpload
-			merged_file.Path = tmp_dir
-			merged_file.FinalPathToCleanup = tmp_dir
-			merged_file.PreferredUploadName = "merged_" + front_side_file.FileName
-			merged_file.FileName, err = MergeScans(
-				FullPath(front_side_file), FullPath(back_side_file), tmp_dir)
-			// If we get an error, it's probably because the files have different
-			// numbers of pages. In this case, it's safer to upload them as two
-			// unmerged monoplex files.
-			// TODO: Instead, just upload the front_side_file and maybe see if a
-			// matching back_side_file comes in shortly thereafter.
-			if err != nil {
-				files_to_upload_chan <- front_side_file
-				files_to_upload_chan <- back_side_file
-				os.RemoveAll(tmp_dir)
-				continue
-			}
-
-			files_to_upload_chan <- merged_file
-
-		// If an 15 min have elapsed, we aren't going to see the paired back side
-		// file, so go ahead and release the front side file as a monoplex file.
-		// This will help us to avoid pairing the wrong front/back files
-		case <-time.After(15 * time.Minute):
-			files_to_upload_chan <- front_side_file
 		}
 	}
 	close(files_to_upload_chan)
@@ -353,15 +353,24 @@ func BlockUntilModificationTimeStable(file_path string) {
 			break
 		} else {
 			modified_time = ModifyTimeOrPanic(file_path)
-			// It's possible that the user is sitting at the flatbed scanner inputting
-			// pages one at at time with significant delays in between. Unfortunately,
-			// as it adds latency, we must delay this quite a bit.
+			// We want to sleep long enough to make sure that we see any change in the
+			// document between accesses, but as short as possible so that we don't
+			// introduce unnessary latency into the scanning process. 10s is arbitrary
+			// here.
+			//
+			// I was worried that it was possible that the user is sitting at the
+			// flatbed scanner inputting pages one at at time with significant delays
+			// in between and that the scanner would send the pages incrementally. At
+			// least in small tests (3 pages) this doesn't seem to happen. The scanner
+			// waits until it has all of the pages (user confirmed) and then uploads. 
+			// It's possible that it still happens if the scanner runs out of memory.
+			//  
 			// TODO: If we see a new document with a later modification time, it's
 			// probably same to assume that this one is now done and we can progress
 			// to waiting on the new document. Or at the very least process files in
 			// parallel or something as this can cause minute delays to pile up in
 			// the face of lots of scans.
-			time.Sleep(time.Minute)
+			time.Sleep(10 * time.Second)
 		}
 	}
 }
