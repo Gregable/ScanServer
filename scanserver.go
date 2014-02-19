@@ -273,13 +273,15 @@ func MergeDuplexScans(config ScanServerConfig,
 	files_to_merge_chan chan FileForUpload,
 	files_to_upload_chan chan FileForUpload) {
 
+FrontLoop:
 	for front_side_file := range files_to_merge_chan {
 		// If it's not duplex, simply schedule for upload. Simple case.
 		if !IsDuplexFile(front_side_file, config) {
 			files_to_upload_chan <- front_side_file
-			continue
+			continue FrontLoop
 		}
 
+	BackLoop:
 		for {
 			select {
 			case back_side_file := <-files_to_merge_chan:
@@ -289,7 +291,7 @@ func MergeDuplexScans(config ScanServerConfig,
 				if !IsDuplexFile(back_side_file, config) {
 					files_to_upload_chan <- front_side_file
 					files_to_upload_chan <- back_side_file
-					break // return to outer for loop and wait for next front_side_file
+					continue FrontLoop
 				}
 
 				log.Println("Merging:", front_side_file.FileName, "and",
@@ -313,16 +315,18 @@ func MergeDuplexScans(config ScanServerConfig,
 					os.RemoveAll(tmp_dir)
 					files_to_upload_chan <- front_side_file
 					front_side_file = back_side_file
-					continue // return to inner loop and wait for next back_side_file
+					continue BackLoop // wait for next back_side_file
 				}
 
 				files_to_upload_chan <- merged_file
+				continue FrontLoop
 
 			// If an 15 min have elapsed, we aren't going to see the paired back side
 			// file, so go ahead and release the front side file as a monoplex file.
 			// This will help us to avoid pairing the wrong front/back files
 			case <-time.After(15 * time.Minute):
 				files_to_upload_chan <- front_side_file
+				continue FrontLoop
 			}
 		}
 	}
