@@ -405,13 +405,13 @@ func UploadFiles(config ScanServerConfig,
 			panic(fmt.Sprintf("error uploading file: %v", err))
 		}
 
-		files_done_chan <- file_for_upload
-
 		modified_time := ModifyTimeOrPanic(FullPath(file_for_upload))
 		if config.LastProccessedScanTime.Before(modified_time) {
 			config.LastProccessedScanTime = modified_time
 			WriteConfig(*config_file, config)
 		}
+
+		files_done_chan <- file_for_upload
 	}
 	close(files_done_chan)
 }
