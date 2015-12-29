@@ -1,3 +1,6 @@
+NOTE: Currently, this script no longer works due to a change in the Google Drive
+API.
+
 ScanServer is a simple script for use with a network attached document scanner
 to upload scanned documents to Google Drive.
 
